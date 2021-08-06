@@ -13,16 +13,28 @@ import argparse
 
 from models import *
 from utils import progress_bar
+import horovod.torch as hvd
 
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-parser.add_argument('--ckpt-dir', default="checkpoint", type=str, help='checkpoint directory')
+parser.add_argument('--ckpt-dir', default="distributed_checkpoint", type=str, help='checkpoint directory')
 parser.add_argument('--resume', '-r', action='store_true',
                     help='resume from checkpoint')
 args = parser.parse_args()
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+#device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# Initialize Horovod
+hvd.init()
+
+device = hvd.local_rank()
+
+# Pin GPU to be used to process local rank (one GPU per process)
+torch.cuda.set_device(device)
+
+num_gpus = hvd.size()
+
 best_acc = 0  # best test accuracy
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
 
@@ -40,10 +52,15 @@ transform_test = transforms.Compose([
     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
 ])
 
+
 trainset = torchvision.datasets.CIFAR10(
     root='./data', train=True, download=True, transform=transform_train)
+
+# Partition dataset among workers using DistributedSampler
+train_sampler = torch.utils.data.distributed.DistributedSampler(
+    trainset, shuffle=True, num_replicas=hvd.size(), rank=hvd.rank())
 trainloader = torch.utils.data.DataLoader(
-    trainset, batch_size=128, shuffle=True, num_workers=2)
+    trainset, batch_size=128, num_workers=2, sampler=train_sampler)
 
 testset = torchvision.datasets.CIFAR10(
     root='./data', train=False, download=True, transform=transform_test)
@@ -71,12 +88,13 @@ print('==> Building model..')
 # net = RegNetX_200MF()
 #net = SimpleDLA()
 net = ResNet50()
-net = net.to(device)
-if device == 'cuda':
-    net = torch.nn.DataParallel(net)
-    cudnn.benchmark = True
+net = net.cuda()
 
-if args.resume:
+# if device == 'cuda':
+#     net = torch.nn.DataParallel(net)
+#     cudnn.benchmark = True
+
+if args.resume and hvd.rank() == 0:
     # Load checkpoint.
     print('==> Resuming from checkpoint..')
     assert os.path.isdir(args.ckpt_dir), 'Error: no checkpoint directory found!'
@@ -86,9 +104,16 @@ if args.resume:
     start_epoch = checkpoint['epoch']
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=args.lr,
+optimizer = optim.SGD(net.parameters(), lr=args.lr * hvd.size(),
                       momentum=0.9, weight_decay=5e-4)
+
+## Add distributed optimizer
+optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=net.named_parameters())
+
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+
+hvd.broadcast_parameters(net.state_dict(), 0)
+hvd.broadcast_optimizer_state(optimizer, 0)
 
 
 # Training
@@ -111,8 +136,9 @@ def train(epoch):
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
 
-        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                     % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+        if hvd.local_rank() == 0:
+            progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                        % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
 
 def test(epoch):
@@ -144,9 +170,11 @@ def test(epoch):
             'acc': acc,
             'epoch': epoch,
         }
-        if not os.path.isdir(args.ckpt_dir):
-            os.mkdir(args.ckpt_dir)
-        torch.save(state, './{}/ckpt.pth'.format(args.ckpt_dir))
+
+        if hvd.rank() == 0:
+            if not os.path.isdir(args.ckpt_dir):
+                os.mkdir(args.ckpt_dir)
+            torch.save(state, './{}/ckpt.pth'.format(args.ckpt_dir))
         best_acc = acc
 
 
