@@ -33,3 +33,25 @@ python main.py --resume --lr=0.01
 | [DPN92](https://arxiv.org/abs/1707.01629)             | 95.16%      |
 | [DLA](https://arxiv.org/pdf/1707.06484.pdf)           | 95.47%      |
 
+## Multi GPU training using Horovod
+
+### 1. Add Horovod import
+
+### 2. Initialize Horovod
+
+### 3. Pin GPU to be used by each process
+
+### 4. Add distributed sampler for distributed sampling across processes
+
+### 5. Read checkpoint only on the first worker
+
+### 6. Broadcast start epoch
+
+### 7. Broadcast the model params from first worker to everyone else
+
+### 8. Adjust learning rate and add Distributed Optimizer
+
+### 9. Aggregate losses and predictions across processes to calculate overall loss and accuracy
+
+
+ 

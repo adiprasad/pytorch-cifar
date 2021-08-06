@@ -15,6 +15,8 @@ from models import *
 from utils import progress_bar
 import horovod.torch as hvd
 
+from horovod.torch.mpi_ops import Sum
+
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
@@ -28,12 +30,11 @@ args = parser.parse_args()
 # Initialize Horovod
 hvd.init()
 
+## Get the rank of current process
 device = hvd.local_rank()
 
 # Pin GPU to be used to process local rank (one GPU per process)
 torch.cuda.set_device(device)
-
-num_gpus = hvd.size()
 
 best_acc = 0  # best test accuracy
 start_epoch = 0  # start from epoch 0 or last checkpoint epoch
@@ -64,8 +65,12 @@ trainloader = torch.utils.data.DataLoader(
 
 testset = torchvision.datasets.CIFAR10(
     root='./data', train=False, download=True, transform=transform_test)
+
+# Partition val dataset among workers using DistributedSampler
+val_sampler = torch.utils.data.distributed.DistributedSampler(
+    testset, shuffle=True, num_replicas=hvd.size(), rank=hvd.rank())
 testloader = torch.utils.data.DataLoader(
-    testset, batch_size=100, shuffle=False, num_workers=2)
+    testset, batch_size=100, shuffle=False, num_workers=2, sampler=val_sampler)
 
 classes = ('plane', 'car', 'bird', 'cat', 'deer',
            'dog', 'frog', 'horse', 'ship', 'truck')
@@ -88,7 +93,7 @@ print('==> Building model..')
 # net = RegNetX_200MF()
 #net = SimpleDLA()
 net = ResNet50()
-net = net.cuda()
+net = net.to(device)
 
 # if device == 'cuda':
 #     net = torch.nn.DataParallel(net)
@@ -103,6 +108,11 @@ if args.resume and hvd.rank() == 0:
     best_acc = checkpoint['acc']
     start_epoch = checkpoint['epoch']
 
+start_epoch = hvd.broadcast(torch.Tensor(1).fill_(start_epoch)[0], name="start_epoch", root_rank=0)
+start_epoch = int(start_epoch)
+
+hvd.broadcast_parameters(net.state_dict(), 0)
+
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr * hvd.size(),
                       momentum=0.9, weight_decay=5e-4)
@@ -112,7 +122,6 @@ optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=net.named_param
 
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
-hvd.broadcast_parameters(net.state_dict(), 0)
 hvd.broadcast_optimizer_state(optimizer, 0)
 
 
@@ -136,9 +145,18 @@ def train(epoch):
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
 
+        train_loss_sum_across_batches_multiprocess = hvd.allreduce(torch.Tensor(1).fill_(train_loss)[0],
+                                                                   name="train_loss_sum_multiprocess", op=Sum)
+        total_sum_across_batches_multiprocess = hvd.allreduce(torch.Tensor(1).fill_(total)[0],
+                                                              name="total_sum_multiprocess", op=Sum)
+        correct_sum_across_batches_multiprocess = hvd.allreduce(torch.Tensor(1).fill_(correct)[0],
+                                                                name="correct_sum_multiprocess", op=Sum)
+
         if hvd.local_rank() == 0:
-            progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                        % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+            progress_bar(batch_idx, len(trainloader), '[Train] Average(all procs) Loss : %.3f | Average(all procs) Acc: %.3f%% (%d/%d)'
+                        % (train_loss_sum_across_batches_multiprocess/((batch_idx+1) * hvd.size()),
+                           100.*correct_sum_across_batches_multiprocess/total_sum_across_batches_multiprocess,
+                           correct_sum_across_batches_multiprocess, total_sum_across_batches_multiprocess))
 
 
 def test(epoch):
@@ -158,11 +176,21 @@ def test(epoch):
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
-            progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                         % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
+            test_loss_sum_across_batches_multiprocess = hvd.allreduce(torch.Tensor(1).fill_(test_loss)[0],
+                                                                       name="test_loss_sum_multiprocess", op=Sum)
+            test_total_sum_across_batches_multiprocess = hvd.allreduce(torch.Tensor(1).fill_(total)[0],
+                                                                  name="test_total_sum_multiprocess", op=Sum)
+            test_correct_sum_across_batches_multiprocess = hvd.allreduce(torch.Tensor(1).fill_(correct)[0],
+                                                                    name="test_correct_sum_multiprocess", op=Sum)
+
+            if hvd.local_rank() == 0:
+                progress_bar(batch_idx, len(testloader), '[Val] Average(all procs) Loss : %.3f | Average(all procs) Acc: %.3f%% (%d/%d)'
+                            % (test_loss_sum_across_batches_multiprocess/((batch_idx+1)* hvd.size()),
+                               100.*test_correct_sum_across_batches_multiprocess/test_total_sum_across_batches_multiprocess,
+                               test_correct_sum_across_batches_multiprocess, test_total_sum_across_batches_multiprocess))
 
     # Save checkpoint.
-    acc = 100.*correct/total
+    acc = 100.*test_correct_sum_across_batches_multiprocess/test_total_sum_across_batches_multiprocess
     if acc > best_acc:
         print('Saving..')
         state = {
