@@ -1,5 +1,7 @@
 # Train CIFAR10 with PyTorch
 
+**Adapted from [pytorch-cifar](https://github.com/kuangliu/pytorch-cifar) to make it Horovod compatible**
+
 I'm playing with [PyTorch](http://pytorch.org/) on the CIFAR10 dataset.
 
 ## Prerequisites
